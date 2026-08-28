@@ -1,0 +1,14 @@
+numpy
+pandas
+matplotlib
+opencv-python
+pillow
+rasterio
+geopandas
+scikit-learn
+jupyter
+torch
+torchvision
+transformers
+faiss-cpu
+streamlit
