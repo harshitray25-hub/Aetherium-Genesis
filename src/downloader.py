@@ -23,7 +23,10 @@ mode = input("Choose input type:\n  [1] Search by Place Name & Size (in km)\n  [
 
 if mode == "1":
     place_name = input("Enter place name (e.g., Navi Mumbai Airport, Sector 9 Gurgaon): ").strip()
-    size_km = float(input("Enter bounding box side length in kilometers (e.g., 5): ").strip())
+    
+    # Prompt for size with 3x3 km as the default if left blank
+    size_input = input("Enter bounding box side length in kilometers [default 3]: ").strip()
+    size_km = float(size_input) if size_input else 3.0
     
     print(f"Geocoding '{place_name}'...")
     geo_url = "https://nominatim.openstreetmap.org/search"
@@ -38,7 +41,7 @@ if mode == "1":
     center_lon = float(res[0]['lon'])
     print(f"Found center -> Latitude: {center_lat}, Longitude: {center_lon}")
     
-    # Calculate bounding box from center and size in km
+    # Calculate bounding box from center and size in km (defaulting to 3x3 km side length)
     half_km = size_km / 2.0
     d_lat = half_km / 111.0
     d_lon = half_km / (111.0 * math.cos(math.radians(center_lat)))
