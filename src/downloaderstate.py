@@ -13,10 +13,9 @@ catalog = pystac_client.Client.open(
 )
 
 print("=" * 60)
-print(" State-Level Multi-Tile Grid Downloader (5x5 km Patches)")
+print(" State-Level Grid Downloader (Strict On-Image Cloud Filter)")
 print("=" * 60)
 
-# Region/State input
 place_name = input("Enter state or region name (e.g., Goa, Delhi, Chandigarh): ").strip()
 output_dir = f"./data_{place_name.lower().replace(' ', '_')}"
 os.makedirs(output_dir, exist_ok=True)
@@ -40,13 +39,9 @@ else:
     lat_min, lat_max = center_lat - 0.5, center_lat + 0.5
     lon_min, lon_max = center_lon - 0.5, center_lon + 0.5
 
-print(f"State BBox Bounds -> Lat: [{lat_min}, {lat_max}], Lon: [{lon_min}, {lon_max}]")
-
-# Target timeframe specification
-target_date_str = input("Enter target timeframe date (YYYY-MM-DD, e.g., 2025-12-02): ").strip()
+target_date_str = input("Enter target timeframe date (YYYY-MM-DD, e.g., 2025-01-01): ").strip()
 target_date = datetime.strptime(target_date_str, "%Y-%m-%d")
 
-# Layer / Band configuration selection
 print("\nSelect Imagery Layer / Band Combination:")
 print("  [1] True Color (RGB - Natural Visual)")
 print("  [2] False Color / NIR (Vegetation & Water analysis - Bands: B08, B04, B03)")
@@ -63,7 +58,6 @@ else:
     assets = ["B04", "B03", "B02"]
     layer_name = "True_Color"
 
-# Generate a grid of 5x5 km bounding boxes covering the state bounding box
 step_deg = 0.045
 lat_steps = []
 curr_lat = lat_min
@@ -78,10 +72,11 @@ while curr_lon < lon_max:
     curr_lon += step_deg
 
 total_tiles = len(lat_steps) * len(lon_steps)
-print(f"\nGenerated grid layout: {len(lon_steps)} x {len(lat_steps)} = {total_tiles} individual 5x5 km tiles to fetch.")
+print(f"\nGenerated grid layout: {len(lon_steps)} x {len(lat_steps)} = {total_tiles} individual patches.")
 
-search_start = (target_date - timedelta(days=45)).strftime("%Y-%m-%d")
-search_end = (target_date + timedelta(days=45)).strftime("%Y-%m-%d")
+# ±1 Year search range
+search_start = (target_date - timedelta(days=365)).strftime("%Y-%m-%d")
+search_end = (target_date + timedelta(days=365)).strftime("%Y-%m-%d")
 time_range = f"{search_start}/{search_end}"
 
 tile_count = 0
@@ -91,35 +86,29 @@ for r_idx, (lats, late) in enumerate(lat_steps):
         tile_count += 1
         tile_name = f"tile_r{r_idx}_c{c_idx}"
         
-        print(f"\n[{tile_count}/{total_tiles}] Processing grid patch {tile_name}: {tile_bbox}")
+        print(f"\n[{tile_count}/{total_tiles}] Processing patch {tile_name}...")
         
-        # Search candidate scenes strictly requiring cloud cover < 15% at query level
         search = catalog.search(
             collections=["sentinel-2-l2a"],
             bbox=tile_bbox,
             datetime=time_range,
-            query={"eo:cloud_cover": {"lt": 15}}
+            query={"eo:cloud_cover": {"lt": 10}}
         )
         items = list(search.items())
         if not items:
-            print(f"  ⚠️ No clean scenes (<15% clouds) found for patch {tile_name}. Skipping.")
+            print(f"  ⚠️ No metadata-clean scenes found for {tile_name}.")
             continue
             
         items.sort(key=lambda item: abs(item.datetime.replace(tzinfo=None) - target_date))
         
         patch_downloaded = False
         for item in items:
-            # Strict validation check on actual metadata property
-            cloud_cover = item.properties.get("eo:cloud_cover", 100.0)
-            if cloud_cover >= 15.0:
-                continue
-
             date_str = item.datetime.strftime("%Y-%m-%d")
             filename = f"{date_str}_{tile_name}_{layer_name}.jpg"
             filepath = os.path.join(output_dir, filename)
             
             if os.path.exists(filepath):
-                print(f"  -> Patch {tile_name} for date {date_str} (Clouds: {cloud_cover}%) already exists. Skipping.")
+                print(f"  -> {filename} already exists locally. Skipping.")
                 patch_downloaded = True
                 break
 
@@ -139,22 +128,31 @@ for r_idx, (lats, late) in enumerate(lat_steps):
                     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
                         img = img.convert("RGB")
                         
-                    # Filter black edge swaths (> 20% void)
+                    # 1. Filter out black edge padding (> 20% void)
                     thumb = img.resize((50, 50))
-                    dark_pixels = sum(1 for p in thumb.getdata() if sum(p[:3]) < 35)
-                    total_pixels = 50 * 50
+                    pixels = list(thumb.getdata())
+                    dark_pixels = sum(1 for p in pixels if sum(p[:3]) < 35)
+                    if (dark_pixels / len(pixels)) > 0.20:
+                        continue
+                        
+                    # 2. Strict On-Image Cloud & Haze Pixel Check
+                    # Clouds appear as high-luminance, low-saturation white patches (R, G, B all > 200)
+                    cloud_pixels = sum(1 for p in pixels if p[0] > 200 and p[1] > 200 and p[2] > 200)
+                    cloud_percentage = (cloud_pixels / len(pixels)) * 100
                     
-                    if (dark_pixels / total_pixels) > 0.20:
+                    if cloud_percentage > 3.0:
+                        print(f"  [Rejected] Date {date_str}: Contains visible cloud cover ({round(cloud_percentage, 1)}%). Searching next...")
                         continue
                         
                     img.save(filepath, "JPEG")
-                    print(f"  ✅ Saved clean patch -> {filename} (Cloud Cover: {cloud_cover}%)")
+                    delta_days = abs((item.datetime.replace(tzinfo=None) - target_date).days)
+                    print(f"  ✅ Saved cloud-free patch -> {filename} (Date: {date_str}, Delta: {delta_days} days)")
                     patch_downloaded = True
                     break
             except Exception:
                 continue
                 
         if not patch_downloaded:
-            print(f"  ❌ Could not find a suitable cloud-free (<15%) observation for patch {tile_name}.")
+            print(f"  ❌ Could not find a visually cloud-free observation for patch {tile_name} within ±1 year.")
 
-print(f"\nDownload complete! All 5x5 km tiles saved inside folder: '{output_dir}'.")
+print(f"\nDownload complete! Clean tiles saved in '{output_dir}'.")
