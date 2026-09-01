@@ -17,7 +17,7 @@ catalog = pystac_client.Client.open(
 
 while True:
     print("=" * 60)
-    print(" Advanced Interactive Sentinel-2 Downloader")
+    print(" Advanced Interactive Sentinel-2 Downloader (Multi-Layer)")
     print("=" * 60)
 
     # Mode selection: Place Name with Size in KM vs Direct BBox Coordinates
@@ -89,31 +89,25 @@ while True:
     time_range = f"{start_date}/{end_date}"
 
     # Target exact amount configuration (x images)
-    target_amount = int(input("Enter exact number of clean images required (x): ").strip())
+    target_amount = int(input("Enter exact number of clean image sets required (x): ").strip())
 
-    # Layer / Band configuration selection
-    print("\nSelect Imagery Layer / Band Combination:")
-    print("  [1] True Color (RGB - Natural Visual)")
-    print("  [2] False Color / NIR (Vegetation & Water analysis - Bands: B08, B04, B03)")
-    print("  [3] Agriculture / SWIR (Soil & Crop monitoring - Bands: B11, B8A, B02)")
-    layer_choice = input("Select option (1, 2, or 3): ").strip()
+    # Master Layer Dictionary mapping the folder name to its specific satellite bands
+    layer_configs = {
+        "true_color": ["B04", "B03", "B02"],
+        "false_color_nir": ["B08", "B04", "B03"],
+        "agriculture_swir": ["B11", "B8A", "B02"]
+    }
 
-    if layer_choice == "2":
-        assets = ["B08", "B04", "B03"]
-        layer_suffix = "false_color_nir"
-    elif layer_choice == "3":
-        assets = ["B11", "B8A", "B02"]
-        layer_suffix = "agriculture_swir"
-    else:
-        assets = ["B04", "B03", "B02"]
-        layer_suffix = "true_color"
-
-    output_dir = os.path.join(MASTER_DATA_ROOT, place_folder_name, layer_suffix)
-    os.makedirs(output_dir, exist_ok=True)
+    # Generate all three sub-directories automatically
+    output_dirs = {}
+    for layer_suffix in layer_configs.keys():
+        dir_path = os.path.join(MASTER_DATA_ROOT, place_folder_name, layer_suffix)
+        os.makedirs(dir_path, exist_ok=True)
+        output_dirs[layer_suffix] = dir_path
 
     print(f"\nConfiguration complete.")
-    print(f"Target Directory: {output_dir}")
-    print(f"Target Clean Images Needed: {target_amount}")
+    print(f"Target Parent Directory: {os.path.join(MASTER_DATA_ROOT, place_folder_name)}")
+    print(f"Target Clean Image Sets Needed: {target_amount} (Extracting 3 layers per set)")
 
     print("Searching Planetary Computer archive...")
     search = catalog.search(
@@ -126,7 +120,6 @@ while True:
     items = list(search.items())
     print(f"Found {len(items)} total candidate scenes in archive. Validating frames to meet quota...")
 
-    # Group by month to find the cleanest candidate per month, sorted chronologically descending (newest first or oldest first)
     monthly_dict = {}
     for item in items:
         month_key = item.datetime.strftime("%Y-%m")
@@ -138,69 +131,98 @@ while True:
             if cloud_cover < monthly_dict[month_key][0]:
                 monthly_dict[month_key] = (cloud_cover, item)
 
-    # Sort available candidate items by date
     sorted_months = sorted(monthly_dict.keys())
     available_items = [monthly_dict[m][1] for m in sorted_months]
 
-    success_count = 0
     saved_items_count = 0
 
-    # Iterate through candidates until we hit our exact target quota (x) or run out of items
     for item in available_items:
         if saved_items_count >= target_amount:
             break
 
         date_str = item.datetime.strftime("%Y-%m-%d")
-        filename = f"{date_str}_Sentinel-2_{layer_suffix}.jpg"
-        filepath = os.path.join(output_dir, filename)
         
-        if os.path.exists(filepath):
-            print(f"[{saved_items_count + 1}/{target_amount}] Found existing valid file -> {filename}")
+        # Check if all 3 layers for this date already exist locally
+        all_layers_exist = True
+        for layer_suffix in layer_configs.keys():
+            filepath = os.path.join(output_dirs[layer_suffix], f"{date_str}_Sentinel-2_{layer_suffix}.jpg")
+            if not os.path.exists(filepath):
+                all_layers_exist = False
+                break
+                
+        if all_layers_exist:
+            print(f"[{saved_items_count + 1}/{target_amount}] Found existing valid files for all layers -> {date_str}")
             saved_items_count += 1
             continue
 
         bbox_str = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
-        crop_url = f"https://planetarycomputer.microsoft.com/api/data/v1/item/bbox/{bbox_str}/800x800.jpg"
-        params = {
-            "collection": "sentinel-2-l2a",
-            "item": item.id,
-            "assets": assets,
-            "color_formula": "Gamma RGB 3.2 Saturation 0.8 Sigmoidal RGB 25 0.35"
-        }
         
-        try:
-            response = requests.get(crop_url, params=params)
-            if response.status_code == 200:
-                img = Image.open(BytesIO(response.content))
-                
-                if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-                    img = img.convert("RGB")
-                    
-                thumb = img.resize((50, 50))
-                dark_pixels = sum(1 for p in thumb.getdata() if sum(p[:3]) < 35)
-                total_pixels = 50 * 50
-                
-                if (dark_pixels / total_pixels) > 0.20:
-                    print(f"  [Skipped] {date_str}: Frame contains too much black/empty edge padding. Searching next available...")
-                    continue
-                    
-                img.save(filepath, "JPEG")
-                saved_items_count += 1
-                print(f"[{saved_items_count}/{target_amount}] Saved clean crop -> {filename}")
-            else:
-                print(f"  [Error] Failed to fetch {date_str} (Status: {response.status_code})")
-        except Exception as e:
-            print(f"  [Error] {date_str}: {e}")
+        # Keep track of successful downloads in this iteration in case one fails
+        success_for_this_date = True
+        temp_saved_files = []
 
-    # Strict Quota Enforcement Check
+        for layer_suffix, assets in layer_configs.items():
+            filepath = os.path.join(output_dirs[layer_suffix], f"{date_str}_Sentinel-2_{layer_suffix}.jpg")
+            
+            # Skip if just this specific layer already downloaded in a previous broken run
+            if os.path.exists(filepath):
+                temp_saved_files.append(filepath)
+                continue
+
+            crop_url = f"https://planetarycomputer.microsoft.com/api/data/v1/item/bbox/{bbox_str}/800x800.jpg"
+            params = {
+                "collection": "sentinel-2-l2a",
+                "item": item.id,
+                "assets": assets,
+                "color_formula": "Gamma RGB 3.2 Saturation 0.8 Sigmoidal RGB 25 0.35"
+            }
+            
+            try:
+                response = requests.get(crop_url, params=params)
+                if response.status_code == 200:
+                    img = Image.open(BytesIO(response.content))
+                    
+                    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                        img = img.convert("RGB")
+                        
+                    # Artifact gating applied to each layer
+                    thumb = img.resize((50, 50))
+                    dark_pixels = sum(1 for p in thumb.getdata() if sum(p[:3]) < 35)
+                    total_pixels = 50 * 50
+                    
+                    if (dark_pixels / total_pixels) > 0.20:
+                        print(f"  [Skipped] {date_str}: {layer_suffix} frame contains too much black/empty edge padding.")
+                        success_for_this_date = False
+                        break
+                        
+                    img.save(filepath, "JPEG")
+                    temp_saved_files.append(filepath)
+                else:
+                    print(f"  [Error] Failed to fetch {date_str} {layer_suffix} (Status: {response.status_code})")
+                    success_for_this_date = False
+                    break
+            except Exception as e:
+                print(f"  [Error] {date_str} {layer_suffix}: {e}")
+                success_for_this_date = False
+                break
+
+        if success_for_this_date:
+            saved_items_count += 1
+            print(f"[{saved_items_count}/{target_amount}] Saved clean multi-layer suite -> {date_str}")
+        else:
+            # Clean up incomplete sets if one layer fails artifact gating
+            for p in temp_saved_files:
+                if os.path.exists(p):
+                    os.remove(p)
+            print(f"  [Skipped] {date_str}: Failed to gather all 3 layers cleanly. Moving to next date...")
+
     if saved_items_count < target_amount:
-        print(f"\n❌ ERROR: Could not collect the requested {target_amount} images. Only found {saved_items_count} clean frames meeting quality standards in this timeframe/area.")
-        print("💡 Tip: Try expanding your date range, increasing the bounding box size, or requesting a smaller number of images.")
+        print(f"\n❌ ERROR: Could not collect the requested {target_amount} image sets. Only found {saved_items_count} clean frames meeting quality standards.")
+        print("💡 Tip: Try expanding your date range or increasing the bounding box size.")
     else:
-        print(f"\nSuccessfully gathered your requested quota of {target_amount} clean frames in '{output_dir}'.")
+        print(f"\nSuccessfully gathered your requested quota of {target_amount} multi-layer frame sets.")
 
-    # Ask user whether to continue or close
-    choice = input("\nWould you like to download another location/layer?\n  [1] Continue (Run again)\n  [2] Close (Exit)\nSelect option (1 or 2): ").strip()
+    choice = input("\nWould you like to download another location?\n  [1] Continue (Run again)\n  [2] Close (Exit)\nSelect option (1 or 2): ").strip()
     if choice != '1':
         print("Exiting downloader. Happy mapping!")
         break
