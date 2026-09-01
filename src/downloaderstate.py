@@ -64,7 +64,6 @@ else:
     layer_name = "True_Color"
 
 # Generate a grid of 5x5 km bounding boxes covering the state bounding box
-# 5 km is roughly 0.045 degrees latitude and longitude offset
 step_deg = 0.045
 lat_steps = []
 curr_lat = lat_min
@@ -94,28 +93,33 @@ for r_idx, (lats, late) in enumerate(lat_steps):
         
         print(f"\n[{tile_count}/{total_tiles}] Processing grid patch {tile_name}: {tile_bbox}")
         
-        # Search candidate scenes for this specific 5x5km patch
+        # Search candidate scenes strictly requiring cloud cover < 15% at query level
         search = catalog.search(
             collections=["sentinel-2-l2a"],
             bbox=tile_bbox,
             datetime=time_range,
-            query={"eo:cloud_cover": {"lt": 10}}
+            query={"eo:cloud_cover": {"lt": 15}}
         )
         items = list(search.items())
         if not items:
-            print(f"  ⚠️ No clean scenes found for patch {tile_name}. Skipping.")
+            print(f"  ⚠️ No clean scenes (<15% clouds) found for patch {tile_name}. Skipping.")
             continue
             
         items.sort(key=lambda item: abs(item.datetime.replace(tzinfo=None) - target_date))
         
         patch_downloaded = False
         for item in items:
+            # Strict validation check on actual metadata property
+            cloud_cover = item.properties.get("eo:cloud_cover", 100.0)
+            if cloud_cover >= 15.0:
+                continue
+
             date_str = item.datetime.strftime("%Y-%m-%d")
             filename = f"{date_str}_{tile_name}_{layer_name}.jpg"
             filepath = os.path.join(output_dir, filename)
             
             if os.path.exists(filepath):
-                print(f"  -> Patch {tile_name} for date {date_str} already exists. Skipping.")
+                print(f"  -> Patch {tile_name} for date {date_str} (Clouds: {cloud_cover}%) already exists. Skipping.")
                 patch_downloaded = True
                 break
 
@@ -144,12 +148,16 @@ for r_idx, (lats, late) in enumerate(lat_steps):
                         continue
                         
                     img.save(filepath, "JPEG")
-                    print(f"  ✅ Saved clean patch -> {filename}")
+                    print(f"  ✅ Saved clean patch -> {filename} (Cloud Cover: {cloud_cover}%)")
                     patch_downloaded = True
                     break
             except Exception:
                 continue
                 
+        if not patch_downloaded:
+            print(f"  ❌ Could not find a suitable cloud-free (<15%) observation for patch {tile_name}.")
+
+print(f"\nDownload complete! All 5x5 km tiles saved inside folder: '{output_dir}'.")
         if not patch_downloaded:
             print(f"  ❌ Could not find a cloud/artifact-free observation for patch {tile_name}.")
 
