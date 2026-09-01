@@ -158,7 +158,3 @@ for r_idx, (lats, late) in enumerate(lat_steps):
             print(f"  ❌ Could not find a suitable cloud-free (<15%) observation for patch {tile_name}.")
 
 print(f"\nDownload complete! All 5x5 km tiles saved inside folder: '{output_dir}'.")
-        if not patch_downloaded:
-            print(f"  ❌ Could not find a cloud/artifact-free observation for patch {tile_name}.")
-
-print(f"\nDownload complete! All 5x5 km tiles saved inside folder: '{output_dir}'.")
