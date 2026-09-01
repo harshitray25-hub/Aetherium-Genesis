@@ -6,6 +6,10 @@ import requests
 from PIL import Image
 from io import BytesIO
 
+# Master parent directory where all location datasets will be organized
+MASTER_DATA_ROOT = "satellite_datasets"
+os.makedirs(MASTER_DATA_ROOT, exist_ok=True)
+
 catalog = pystac_client.Client.open(
     "https://planetarycomputer.microsoft.com/api/stac/v1",
     modifier=planetary_computer.sign_inplace,
@@ -24,7 +28,6 @@ while True:
     if mode == "1":
         place_name = input("Enter place name (e.g., Navi Mumbai Airport, Sector 9 Gurgaon): ").strip()
         
-        # Prompt for size with 3x3 km as the default if left blank
         size_input = input("Enter bounding box side length in kilometers [default 3]: ").strip()
         size_km = float(size_input) if size_input else 3.0
         
@@ -41,7 +44,6 @@ while True:
         center_lon = float(res[0]['lon'])
         print(f"Found center -> Latitude: {center_lat}, Longitude: {center_lon}")
         
-        # Calculate bounding box from center and size in km
         half_km = size_km / 2.0
         d_lat = half_km / 111.0
         d_lon = half_km / (111.0 * math.cos(math.radians(center_lat)))
@@ -86,8 +88,8 @@ while True:
     end_date = input("Enter end date (YYYY-MM-DD, e.g., 2026-12-31): ").strip()
     time_range = f"{start_date}/{end_date}"
 
-    # Amount configuration
-    max_amount = int(input("Enter maximum number of monthly images to download (e.g., 30): ").strip())
+    # Target exact amount configuration (x images)
+    target_amount = int(input("Enter exact number of clean images required (x): ").strip())
 
     # Layer / Band configuration selection
     print("\nSelect Imagery Layer / Band Combination:")
@@ -106,13 +108,12 @@ while True:
         assets = ["B04", "B03", "B02"]
         layer_suffix = "true_color"
 
-    # Create dynamic output directory structure: data_place_name/layer_name
-    output_dir = os.path.join(place_folder_name, layer_suffix)
+    output_dir = os.path.join(MASTER_DATA_ROOT, place_folder_name, layer_suffix)
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\nConfiguration complete.")
     print(f"Target Directory: {output_dir}")
-    print(f"Time range: {time_range}, Max items: {max_amount}")
+    print(f"Target Clean Images Needed: {target_amount}")
 
     print("Searching Planetary Computer archive...")
     search = catalog.search(
@@ -123,8 +124,9 @@ while True:
     )
 
     items = list(search.items())
-    print(f"Found {len(items)} total scenes. Processing monthly frames...")
+    print(f"Found {len(items)} total candidate scenes in archive. Validating frames to meet quota...")
 
+    # Group by month to find the cleanest candidate per month, sorted chronologically descending (newest first or oldest first)
     monthly_dict = {}
     for item in items:
         month_key = item.datetime.strftime("%Y-%m")
@@ -136,20 +138,25 @@ while True:
             if cloud_cover < monthly_dict[month_key][0]:
                 monthly_dict[month_key] = (cloud_cover, item)
 
+    # Sort available candidate items by date
     sorted_months = sorted(monthly_dict.keys())
-    selected_items = [monthly_dict[m][1] for m in sorted_months][-max_amount:]
-
-    print(f"Validating and downloading up to {len(selected_items)} clean monthly scenes...")
+    available_items = [monthly_dict[m][1] for m in sorted_months]
 
     success_count = 0
-    for idx, item in enumerate(selected_items, 1):
+    saved_items_count = 0
+
+    # Iterate through candidates until we hit our exact target quota (x) or run out of items
+    for item in available_items:
+        if saved_items_count >= target_amount:
+            break
+
         date_str = item.datetime.strftime("%Y-%m-%d")
         filename = f"{date_str}_Sentinel-2_{layer_suffix}.jpg"
         filepath = os.path.join(output_dir, filename)
         
         if os.path.exists(filepath):
-            print(f"[{idx}/{len(selected_items)}] Skipping {filename} (already exists).")
-            success_count += 1
+            print(f"[{saved_items_count + 1}/{target_amount}] Found existing valid file -> {filename}")
+            saved_items_count += 1
             continue
 
         bbox_str = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
@@ -174,18 +181,23 @@ while True:
                 total_pixels = 50 * 50
                 
                 if (dark_pixels / total_pixels) > 0.20:
-                    print(f"  [Skipped] {date_str}: Frame contains too much black/empty edge padding.")
+                    print(f"  [Skipped] {date_str}: Frame contains too much black/empty edge padding. Searching next available...")
                     continue
                     
                 img.save(filepath, "JPEG")
-                print(f"[{idx}/{len(selected_items)}] Saved clean crop -> {filepath}")
-                success_count += 1
+                saved_items_count += 1
+                print(f"[{saved_items_count}/{target_amount}] Saved clean crop -> {filename}")
             else:
                 print(f"  [Error] Failed to fetch {date_str} (Status: {response.status_code})")
         except Exception as e:
             print(f"  [Error] {date_str}: {e}")
 
-    print(f"\nDownload complete! Successfully gathered {success_count} clean frames in '{output_dir}'.")
+    # Strict Quota Enforcement Check
+    if saved_items_count < target_amount:
+        print(f"\n❌ ERROR: Could not collect the requested {target_amount} images. Only found {saved_items_count} clean frames meeting quality standards in this timeframe/area.")
+        print("💡 Tip: Try expanding your date range, increasing the bounding box size, or requesting a smaller number of images.")
+    else:
+        print(f"\nSuccessfully gathered your requested quota of {target_amount} clean frames in '{output_dir}'.")
 
     # Ask user whether to continue or close
     choice = input("\nWould you like to download another location/layer?\n  [1] Continue (Run again)\n  [2] Close (Exit)\nSelect option (1 or 2): ").strip()
