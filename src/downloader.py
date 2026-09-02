@@ -3,6 +3,7 @@ import math
 import pystac_client
 import planetary_computer
 import requests
+import numpy as np
 from PIL import Image
 from io import BytesIO
 
@@ -17,7 +18,7 @@ catalog = pystac_client.Client.open(
 
 while True:
     print("=" * 60)
-    print(" Advanced Interactive Sentinel-2 Downloader (Multi-Layer)")
+    print(" Advanced Interactive Sentinel-2 Downloader (Temporal Spread)")
     print("=" * 60)
 
     # Mode selection: Place Name with Size in KM vs Direct BBox Coordinates
@@ -84,8 +85,8 @@ while True:
         place_folder_name = f"data_{clean_place_name}"
 
     # Time period configuration
-    start_date = input("Enter start date (YYYY-MM-DD, e.g., 2023-01-01): ").strip()
-    end_date = input("Enter end date (YYYY-MM-DD, e.g., 2026-12-31): ").strip()
+    start_date = input("Enter start date (YYYY-MM-DD, e.g., 2020-01-01): ").strip()
+    end_date = input("Enter end date (YYYY-MM-DD, e.g., 2025-12-31): ").strip()
     time_range = f"{start_date}/{end_date}"
 
     # Target exact amount configuration (x images)
@@ -132,11 +133,23 @@ while True:
                 monthly_dict[month_key] = (cloud_cover, item)
 
     sorted_months = sorted(monthly_dict.keys())
-    available_items = [monthly_dict[m][1] for m in sorted_months]
+    all_available_items = [monthly_dict[m][1] for m in sorted_months]
+
+    # Apply Even Temporal Spreading across the available archive pool
+    if len(all_available_items) <= target_amount:
+        selected_items = all_available_items
+    else:
+        if target_amount <= 1:
+            selected_items = [all_available_items[0]]
+        else:
+            selected_items = []
+            for i in range(target_amount):
+                idx = round(i * (len(all_available_items) - 1) / (target_amount - 1))
+                selected_items.append(all_available_items[idx])
 
     saved_items_count = 0
 
-    for item in available_items:
+    for item in selected_items:
         if saved_items_count >= target_amount:
             break
 
@@ -157,14 +170,12 @@ while True:
 
         bbox_str = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
         
-        # Keep track of successful downloads in this iteration in case one fails
         success_for_this_date = True
         temp_saved_files = []
 
         for layer_suffix, assets in layer_configs.items():
             filepath = os.path.join(output_dirs[layer_suffix], f"{date_str}_Sentinel-2_{layer_suffix}.jpg")
             
-            # Skip if just this specific layer already downloaded in a previous broken run
             if os.path.exists(filepath):
                 temp_saved_files.append(filepath)
                 continue
@@ -185,13 +196,27 @@ while True:
                     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
                         img = img.convert("RGB")
                         
-                    # Artifact gating applied to each layer
+                    # Artifact gating applied to each layer using NumPy for speed and deprecation safety
                     thumb = img.resize((50, 50))
-                    dark_pixels = sum(1 for p in thumb.getdata() if sum(p[:3]) < 35)
+                    arr = np.array(thumb)
+                    dark_pixels = np.sum(np.sum(arr[:, :, :3], axis=2) < 35)
                     total_pixels = 50 * 50
                     
-                    if (dark_pixels / total_pixels) > 0.20:
-                        print(f"  [Skipped] {date_str}: {layer_suffix} frame contains too much black/empty edge padding.")
+                    # Enhanced strip and global void filtering matching your strict pipeline rules
+                    row_means = np.mean(arr[:, :, :3], axis=(1, 2))
+                    col_means = np.mean(arr[:, :, :3], axis=(0, 2))
+                    dead_rows = np.sum(row_means < 35)
+                    dead_cols = np.sum(col_means < 35)
+                    
+                    if (dark_pixels / total_pixels) > 0.15 or dead_rows >= 8 or dead_cols >= 8:
+                        print(f"  [Skipped] {date_str}: {layer_suffix} frame contains too much black/empty edge padding or strip voids.")
+                        success_for_this_date = False
+                        break
+                        
+                    # Strict On-Image Cloud Pixel Filter (max 3% visible cloud cover)
+                    cloud_pixels = np.sum((arr[:, :, 0] > 200) & (arr[:, :, 1] > 200) & (arr[:, :, 2] > 200))
+                    if (cloud_pixels / (50 * 50)) * 100 > 3.0:
+                        print(f"  [Skipped] {date_str}: {layer_suffix} frame contains visible clouds above threshold.")
                         success_for_this_date = False
                         break
                         
@@ -210,7 +235,6 @@ while True:
             saved_items_count += 1
             print(f"[{saved_items_count}/{target_amount}] Saved clean multi-layer suite -> {date_str}")
         else:
-            # Clean up incomplete sets if one layer fails artifact gating
             for p in temp_saved_files:
                 if os.path.exists(p):
                     os.remove(p)
@@ -220,7 +244,7 @@ while True:
         print(f"\n❌ ERROR: Could not collect the requested {target_amount} image sets. Only found {saved_items_count} clean frames meeting quality standards.")
         print("💡 Tip: Try expanding your date range or increasing the bounding box size.")
     else:
-        print(f"\nSuccessfully gathered your requested quota of {target_amount} multi-layer frame sets.")
+        print(f"\nSuccessfully gathered your requested quota of {target_amount} temporally-spaced multi-layer frame sets.")
 
     choice = input("\nWould you like to download another location?\n  [1] Continue (Run again)\n  [2] Close (Exit)\nSelect option (1 or 2): ").strip()
     if choice != '1':
