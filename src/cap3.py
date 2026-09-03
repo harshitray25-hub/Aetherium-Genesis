@@ -10,7 +10,7 @@ import open_clip
 from huggingface_hub import hf_hub_download
 from datetime import datetime
 
-print("Initializing Capability 3: Multi-Band Quality Enhancement & Standardization Engine...")
+print("Initializing Capability 3: Multi-Band Quality Gating & Perimeter Border Check Engine...")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_name = 'ViT-L-14'
@@ -33,13 +33,63 @@ print("Model loaded locally and ready!\n")
 
 class MultiBandQualityEnhancementPipeline:
     """
-    Capability 3: Multi-Band Quality Handling & Image Standardization Engine.
-    Extends standardization across all spectral bands (True Color, False Color NIR, and Agriculture SWIR).
-    Finds the clearest reference image per band folder, uses it as a master standard, and applies 
-    physics-based dehazing, illumination balancing, and histogram matching across all layers.
+    Capability 3: Multi-Band Quality Handling & Standardization Engine.
+    Strictly checks for cloud cover and actual black border edges/nodata padding 
+    around the image frame perimeter, structuring outputs neatly into 
+    'satellite_datasets_cleaned/data_placename_size/[layers]'.
     """
     def __init__(self, device=device):
         self.device = device
+
+    def check_cloud_rejection(self, img_bgr, max_cloud_pct=15.0):
+        """Detects and measures cloud cover percentage using HSV thresholds."""
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        _, s, v = cv2.split(hsv)
+        bright = v > 180
+        low_sat = s < 45
+        cloud_pixels = np.sum(bright & low_sat)
+        total_pixels = img_bgr.shape[0] * img_bgr.shape[1]
+        pct = (cloud_pixels / total_pixels) * 100
+        return pct > max_cloud_pct, pct
+
+    def check_black_borders_rejection(self, img_bgr, border_thickness_pct=0.05, max_edge_black_pct=25.0):
+        """
+        Checks specifically if the outer edges (borders) are completely black/nodata 
+        horizontally and vertically, avoiding false rejections from dark urban pixels inside the map.
+        """
+        h, w = img_bgr.shape[:2]
+        tb = int(h * border_thickness_pct)
+        lr = int(w * border_thickness_pct)
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Extract outer border frames (top, bottom, left, right strips)
+        top_strip = gray[:tb, :]
+        bottom_strip = gray[h-tb:, :]
+        left_strip = gray[:, :lr]
+        right_strip = gray[:, w-lr:]
+
+        borders = np.concatenate([top_strip.flatten(), bottom_strip.flatten(), left_strip.flatten(), right_strip.flatten()])
+        black_border_pixels = np.sum(borders < 15)
+        border_pct = (black_border_pixels / borders.size) * 100
+
+        return border_pct > max_edge_black_pct, border_pct
+
+    def validate_frame(self, image_path):
+        """Runs strict rejection checks for clouds and actual outer black borders."""
+        img = cv2.imread(image_path)
+        if img is None:
+            return True, "Error: Failed to read image file."
+
+        is_cloudy, cloud_pct = self.check_cloud_rejection(img)
+        if is_cloudy:
+            return True, f"Rejected: Excessive cloud cover detected ({cloud_pct:.1f}% > 15%)."
+
+        has_black_edges, edge_black_pct = self.check_black_borders_rejection(img)
+        if has_black_edges:
+            return True, f"Rejected: Excessive black border padding detected ({edge_black_pct:.1f}% > 25% on edges)."
+
+        return False, "Passed quality gate."
 
     def dark_channel_dehaze(self, img_bgr, omega=0.82, patch_size=15):
         """Applies Dark Channel Prior (DCP) physics-based dehazing to strip out atmospheric smog/fog."""
@@ -116,19 +166,14 @@ class MultiBandQualityEnhancementPipeline:
         if img is None:
             return None
 
-        # 1. Physics-based dehazing
         dehazed = self.dark_channel_dehaze(img)
 
-        # 2. PIL Enhancement for balanced contrast and richness
         pil_img = Image.fromarray(cv2.cvtColor(dehazed, cv2.COLOR_BGR2RGB))
         pil_img = ImageEnhance.Color(pil_img).enhance(1.15)
         pil_img = ImageEnhance.Contrast(pil_img).enhance(1.10)
         enhanced_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-        # 3. Histogram matching against the master template image of the same band
         normalized = self.match_histogram(enhanced_bgr, master_template)
-
-        # 4. Edge-preserving smoothing to clean noise while maintaining structure
         cleaned_output = cv2.bilateralFilter(normalized, d=5, sigmaColor=30, sigmaSpace=30)
         return cleaned_output
 
@@ -144,7 +189,7 @@ def interactive_multiband_standardization_menu():
         return
 
     print("=" * 60)
-    print(" CAPABILITY 3: MULTI-BAND QUALITY ENHANCEMENT & STANDARDIZATION")
+    print(" CAPABILITY 3: PERIMETER BORDER CHECK & STANDARDIZATION")
     print("=" * 60)
     for i, folder in enumerate(folders, 1):
         print(f"   [{i}] {folder}")
@@ -158,18 +203,17 @@ def interactive_multiband_standardization_menu():
         print("Invalid input.")
         return
         
-    target_directory = os.path.join(base_dir, folders[folder_choice])
+    region_name = folders[folder_choice]
+    target_directory = os.path.join(base_dir, region_name)
     
-    # Target all three core spectral band directories
-    target_bands = {
-        "true_color": "true_color_standardized_cleaned",
-        "false_color_nir": "false_color_nir_standardized_cleaned",
-        "agriculture_swir": "agriculture_swir_standardized_cleaned"
-    }
+    master_cleaned_root = "./satellite_datasets_cleaned"
+    region_output_root = os.path.join(master_cleaned_root, region_name)
+    os.makedirs(region_output_root, exist_ok=True)
 
+    target_bands = ["true_color", "false_color_nir", "agriculture_swir"]
     engine = MultiBandQualityEnhancementPipeline()
 
-    for band_name, output_folder_name in target_bands.items():
+    for band_name in target_bands:
         band_dir = os.path.join(target_directory, band_name)
         if not os.path.exists(band_dir):
             print(f"\n[-] Skipping band '{band_name}' (Directory not found).")
@@ -181,18 +225,33 @@ def interactive_multiband_standardization_menu():
             continue
 
         print(f"\n------------------------------------------------------------")
-        print(f" Processing Band: [{band_name.upper()}] ({len(image_files)} images)")
+        print(f" Processing Band: [{band_name.upper()}] ({len(image_files)} total files)")
         print(f"------------------------------------------------------------")
 
-        print("Evaluating images to find the clearest master reference standard for this band...")
-        best_image_path = max(image_files, key=lambda p: engine.evaluate_image_clarity(p))
+        output_processed_dir = os.path.join(region_output_root, band_name)
+        os.makedirs(output_processed_dir, exist_ok=True)
+
+        valid_images = []
+        for path in image_files:
+            filename = os.path.basename(path)
+            rejected, reason = engine.validate_frame(path)
+            if rejected:
+                print(f"  [❌ REJECTED] {filename} -> {reason}")
+            else:
+                print(f"  [✓ PASSED]   {filename}")
+                valid_images.append(path)
+
+        if not valid_images:
+            print(f"  ⚠️ No images passed quality gates for band '{band_name}'.")
+            continue
+
+        print("\nEvaluating surviving images to find the master reference standard...")
+        best_image_path = max(valid_images, key=lambda p: engine.evaluate_image_clarity(p))
         master_template = cv2.imread(best_image_path)
         print(f"[*] Master Reference Standard for {band_name}: {os.path.basename(best_image_path)}")
 
-        output_processed_dir = os.path.join(target_directory, output_folder_name)
-        os.makedirs(output_processed_dir, exist_ok=True)
-
-        for path in image_files:
+        print(f"\nEnhancing and standardizing {len(valid_images)} valid images...")
+        for path in valid_images:
             filename = os.path.basename(path)
             print(f"  -> Processing & cleaning: {filename}")
             
@@ -205,8 +264,8 @@ def interactive_multiband_standardization_menu():
                 print(f"     [!] Failed to process image.")
 
     print("\n" + "=" * 60)
-    print(f"Capability 3 Multi-Band Standardization Complete!")
-    print(f"All available bands successfully cleaned, enhanced, and saved.")
+    print(f"Capability 3 Restructuring & Perimeter Border Check Complete!")
+    print(f"Cleaned multi-band layers saved under: '{region_output_root}'")
     print("=" * 60)
 
 if __name__ == "__main__":
